@@ -107,6 +107,13 @@ function CreateMeshCentralServer(config, args) {
         if (obj.fs.existsSync(obj.path.join(__dirname, '../meshcentral-web/emails'))) { obj.webEmailsOverridePath = obj.path.join(__dirname, '../meshcentral-web/emails'); }
     }
 
+    // Clean up any temporary files
+    var removeTime = new Date(Date.now()).getTime() - (30 * 60 * 1000); // 30 minutes
+    var dir = obj.fs.readdir(obj.path.join(obj.filespath, 'tmp'), function (err, files) {
+        if (err != null) return;
+        for (var i in files) { try { const filepath = obj.path.join(obj.filespath, 'tmp', files[i]); if (obj.fs.statSync(filepath).mtime.getTime() < removeTime) { obj.fs.unlink(filepath, function () { }); } } catch (ex) { } }
+    });
+
     // Look to see if data and/or file path is specified
     if (obj.config.settings && (typeof obj.config.settings.datapath == 'string')) { obj.datapath = obj.config.settings.datapath; }
     if (obj.config.settings && (typeof obj.config.settings.filespath == 'string')) { obj.filespath = obj.config.settings.filespath; }
@@ -1093,6 +1100,16 @@ function CreateMeshCentralServer(config, args) {
                 if ((obj.config.domains[i].webpublicpath == null) && (obj.fs.existsSync(obj.path.join(__dirname, '../meshcentral-web-' + i + '/public')))) { obj.config.domains[i].webpublicpath = obj.path.join(__dirname, '../meshcentral-web-' + i + '/public'); }
                 if ((obj.config.domains[i].webemailspath == null) && (obj.fs.existsSync(obj.path.join(__dirname, '../meshcentral-web-' + i + '/emails')))) { obj.config.domains[i].webemailspath = obj.path.join(__dirname, '../meshcentral-web-' + i + '/emails'); }
             }
+
+            // Check agent customization if any
+            if (typeof obj.config.domains[i].agentcustomization == 'object') {
+                if (typeof obj.config.domains[i].agentcustomization.displayname != 'string') { delete obj.config.domains[i].agentcustomization.displayname; } else { obj.config.domains[i].agentcustomization.displayname = obj.config.domains[i].agentcustomization.displayname.split('\r').join('').split('\n').join(''); }
+                if (typeof obj.config.domains[i].agentcustomization.description != 'string') { delete obj.config.domains[i].agentcustomization.description; } else { obj.config.domains[i].agentcustomization.description = obj.config.domains[i].agentcustomization.description.split('\r').join('').split('\n').join(''); }
+                if (typeof obj.config.domains[i].agentcustomization.companyname != 'string') { delete obj.config.domains[i].agentcustomization.companyname; } else { obj.config.domains[i].agentcustomization.companyname = obj.config.domains[i].agentcustomization.companyname.split('\r').join('').split('\n').join(''); }
+                if (typeof obj.config.domains[i].agentcustomization.servicename != 'string') { delete obj.config.domains[i].agentcustomization.servicename; } else { obj.config.domains[i].agentcustomization.servicename = obj.config.domains[i].agentcustomization.servicename.split('\r').join('').split('\n').join('').split(' ').join('').split('"').join('').split('\'').join('').split('>').join('').split('<').join('').split('/').join('').split('\\').join(''); }
+            } else {
+                delete obj.config.domains[i].agentcustomization;
+            }
         }
 
         // Log passed arguments into Windows Service Log
@@ -1549,6 +1566,13 @@ function CreateMeshCentralServer(config, args) {
     obj.maintenanceActions = function () {
         // Perform database maintenance
         obj.db.maintenance();
+
+        // Clean up any temporary files
+        var removeTime = new Date(Date.now()).getTime() - (30 * 60 * 1000); // 30 minutes
+        var dir = obj.fs.readdir(obj.path.join(obj.filespath, 'tmp'), function (err, files) {
+            if (err != null) return;
+            for (var i in files) { try { const filepath = obj.path.join(obj.filespath, 'tmp', files[i]); if (obj.fs.statSync(filepath).mtime.getTime() < removeTime) { obj.fs.unlink(filepath, function () { }); } } catch (ex) { } }
+        });
 
         // Check for self-update that targets a specific version
         if ((typeof obj.args.selfupdate == 'string') && (getCurrentVerion() === obj.args.selfupdate)) { obj.args.selfupdate = false; }
@@ -2194,9 +2218,11 @@ function CreateMeshCentralServer(config, args) {
         26: { id: 26, localname: 'meshagent_arm64', rname: 'meshagent', desc: 'Linux ARMv8-64', update: true, amt: false, platform: 'linux', core: 'linux-noamt', rcore: 'linux-recovery', arcore: 'linux-agentrecovery' }, // "aarch64"
         27: { id: 27, localname: 'meshagent_armhf2', rname: 'meshagent', desc: 'Linux ARM - HardFloat', update: true, amt: false, platform: 'linux', core: 'linux-noamt', rcore: 'linux-recovery', arcore: 'linux-agentrecovery' }, // Raspbian 7 2015-02-02 for old Raspberry Pi.
         28: { id: 28, localname: 'meshagent_mips24kc', rname: 'meshagent', desc: 'Linux MIPS24KC (OpenWRT)', update: true, amt: false, platform: 'linux', core: 'linux-noamt', rcore: 'linux-recovery', arcore: 'linux-agentrecovery' }, // MIPS Router with OpenWRT
+        29: { id: 29, localname: 'meshagent_osx-arm-64', rname: 'meshagent', desc: 'Apple OSX ARM-Any', update: true, amt: false, platform: 'osx', core: 'linux-noamt', rcore: 'linux-recovery', arcore: 'linux-agentrecovery' }, // Apple ARM 64bit
         30: { id: 30, localname: 'meshagent_freebsd_x86-64', rname: 'meshagent', desc: 'FreeBSD x86-64', update: true, amt: false, platform: 'freebsd', core: 'linux-noamt', rcore: 'linux-recovery', arcore: 'linux-agentrecovery' }, // FreeBSD x64
         10003: { id: 3, localname: 'MeshService.exe', rname: 'meshagent.exe', desc: 'Windows x86-32 service', update: true, amt: true, platform: 'win32', core: 'windows-amt', rcore: 'linux-recovery', arcore: 'linux-agentrecovery' }, // Unsigned version of the Windows MeshAgent x86
-        10004: { id: 4, localname: 'MeshService64.exe', rname: 'meshagent.exe', desc: 'Windows x86-64 service', update: true, amt: true, platform: 'win32', core: 'windows-amt', rcore: 'linux-recovery', arcore: 'linux-agentrecovery' } // Unsigned version of the Windows MeshAgent x64
+        10004: { id: 4, localname: 'MeshService64.exe', rname: 'meshagent.exe', desc: 'Windows x86-64 service', update: true, amt: true, platform: 'win32', core: 'windows-amt', rcore: 'linux-recovery', arcore: 'linux-agentrecovery' }, // Unsigned version of the Windows MeshAgent x64
+        10005: { id: 0, localname: 'meshagent_osx-universal-64', rname: 'meshagent', desc: 'Apple OSX Universal Binary', update: true, amt: false, platform: 'osx', core: 'linux-noamt', rcore: 'linux-recovery', arcore: 'linux-agentrecovery' } // Apple Silicon universal binary
     };
 
     // Update the list of available mesh agents

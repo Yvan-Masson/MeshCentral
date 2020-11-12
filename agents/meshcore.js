@@ -43,6 +43,9 @@ var MESHRIGHT_NODESKTOP = 65536;
 
 function createMeshCore(agent) {
     var obj = {};
+    var agentFileHttpRequests = {}; // Currently active agent HTTPS GET requests from the server.
+    var agentFileHttpPendingRequests = []; // Pending HTTPS GET requests from the server.
+
     if (process.platform == 'win32' && require('user-sessions').isRoot()) {
         // Check the Agent Uninstall MetaData for correctness, as the installer may have written an incorrect value
         try {
@@ -416,7 +419,6 @@ function createMeshCore(agent) {
 
     var meshServerConnectionState = 0;
     var tunnels = {};
-    var lastMeInfo = null;
     var lastNetworkInfo = null;
     var lastPublicLocationInfo = null;
     var selfInfoUpdateTimer = null;
@@ -774,7 +776,12 @@ function createMeshCore(agent) {
                                     var woptions = http.parseUri(xurl);
                                     woptions.perMessageDeflate = false;
                                     if (typeof data.perMessageDeflate == 'boolean') { woptions.perMessageDeflate = data.perMessageDeflate; }
+
+                                    // Perform manual server TLS certificate checking based on the certificate hash given by the server.
                                     woptions.rejectUnauthorized = 0;
+                                    woptions.checkServerIdentity = function checkServerIdentity(certs) { if ((checkServerIdentity.servertlshash != null) && (checkServerIdentity.servertlshash != certs[0].digest.split(':').join('').toLowerCase())) { throw new Error('BadCert') } }
+                                    woptions.checkServerIdentity.servertlshash = data.servertlshash;
+
                                     //sendConsoleText(JSON.stringify(woptions));
                                     //sendConsoleText('TUNNEL: ' + JSON.stringify(data));
                                     var tunnel = http.request(woptions);
@@ -1140,11 +1147,48 @@ function createMeshCore(agent) {
                 case 'meshToolInfo':
                     if (data.pipe == true) { delete data.pipe; delete data.action; data.cmd = 'meshToolInfo'; broadcastToRegisteredApps(data); }
                     break;
+                case 'wget': // Server uses this command to tell the agent to download a file using HTTPS/GET and place it in a given path. This is used for one-to-many file uploads.
+                    agentFileHttpPendingRequests.push(data);
+                    serverFetchFile();
+                    break;
                 default:
                     // Unknown action, ignore it.
                     break;
             }
         }
+    }
+
+    // Agent just get a file from the server and save it locally.
+    function serverFetchFile() {
+        if ((Object.keys(agentFileHttpRequests).length > 4) || (agentFileHttpPendingRequests.length == 0)) return; // No more than 4 active HTTPS requests to the server.
+        var data = agentFileHttpPendingRequests.shift();
+        if ((data.overwrite !== true) && fs.existsSync(data.path)) return; // Don't overwrite an existing file.
+        if (data.createFolder) { try { fs.mkdirSync(data.folder); } catch (ex) { } } // If requested, create the local folder.
+        data.url = 'http' + getServerTargetUrlEx('*/').substring(2);
+        var agentFileHttpOptions = http.parseUri(data.url);
+        agentFileHttpOptions.path = data.urlpath;
+
+        // Perform manual server TLS certificate checking based on the certificate hash given by the server.
+        agentFileHttpOptions.rejectUnauthorized = 0;
+        agentFileHttpOptions.checkServerIdentity = function checkServerIdentity(certs) { if ((checkServerIdentity.servertlshash != null) && (checkServerIdentity.servertlshash != certs[0].digest.split(':').join('').toLowerCase())) { throw new Error('BadCert') } }
+        agentFileHttpOptions.checkServerIdentity.servertlshash = data.servertlshash;
+
+        if (agentFileHttpOptions == null) return;
+        var agentFileHttpRequest = http.request(agentFileHttpOptions,
+            function (response) {
+                response.xparent = this;
+                try {
+                    response.xfile = fs.createWriteStream(this.xpath, { flags: 'wbN' })
+                    response.pipe(response.xfile);
+                    response.end = function () { delete agentFileHttpRequests[this.xparent.xurlpath]; delete this.xparent; serverFetchFile(); }
+                } catch (ex) { delete agentFileHttpRequests[this.xurlpath]; delete response.xparent; serverFetchFile(); return; }
+            }
+        );
+        agentFileHttpRequest.on('error', function (ex) { delete agentFileHttpRequests[this.xurlpath]; serverFetchFile(); });
+        agentFileHttpRequest.end();
+        agentFileHttpRequest.xurlpath = data.urlpath;
+        agentFileHttpRequest.xpath = data.path;
+        agentFileHttpRequests[data.urlpath] = agentFileHttpRequest;
     }
 
     // Called when a file changed in the file system
@@ -2174,6 +2218,21 @@ function createMeshCore(agent) {
                         try { fs.renameSync(oldfullpath, newfullpath); } catch (e) { console.log(e); }
                         break;
                     }
+                    case 'findfile': {
+                        // Search for files
+                        var r = require('file-search').find(cmd.path, cmd.filter);
+                        r.socket = this;
+                        r.socket.reqid = cmd.reqid; // Search request id. This is used to send responses and cancel the request.
+                        r.socket.path = cmd.path;   // Search path
+                        r.on('result', function (str) { try { this.socket.write(Buffer.from(JSON.stringify({ action: 'findfile', r: str.substring(this.socket.path.length), reqid: this.socket.reqid }))); } catch (ex) { } });
+                        r.then(function () { try { this.socket.write(Buffer.from(JSON.stringify({ action: 'findfile', r: null, reqid: this.socket.reqid }))); } catch (ex) { } });
+                        break;
+                    }
+                    case 'cancelfindfile': {
+                        // TODO: Cancel a search for files
+                        // cmd.reqid <-- Cancel this reqid
+                        sendConsoleText('cancelfindfile: ' + cmd.reqid);
+                    }
                     case 'download': {
                         // Download a file
                         var sendNextBlock = 0;
@@ -2602,6 +2661,22 @@ function createMeshCore(agent) {
                     response = "Available commands: \r\n" + fin + ".";
                     break;
                 }
+                case 'find':
+                    if (args['_'].length <= 1)
+                    {
+                        response = "Proper usage:\r\n  find root criteria [criteria2] [criteria n...]";
+                    }
+                    else
+                    {
+                        var root = args['_'][0];
+                        var p = args['_'].slice(1);
+                        var r = require('file-search').find(root, p);
+                        r.sid = sessionid;
+                        r.on('result', function (str) { sendConsoleText(str, this.sid); });
+                        r.then(function () { sendConsoleText('*** End Results ***', this.sid); });
+                        response = "Find: [" + root + "] " + JSON.stringify(p);
+                    }
+                    break;
                 case 'coreinfo': {
                     response = JSON.stringify(meshCoreObj, null, 2);
                     break;
@@ -3193,7 +3268,6 @@ function createMeshCore(agent) {
                     if (meshCoreObj.osdesc) { response += '\r\nOS: ' + meshCoreObj.osdesc + '.'; }
                     response += '\r\nModules: ' + addedModules.join(', ') + '.';
                     response += '\r\nServer Connection: ' + mesh.isControlChannelConnected + ', State: ' + meshServerConnectionState + '.';
-                    response += '\r\lastMeInfo: ' + lastMeInfo + '.';
                     var oldNodeId = db.Get('OldNodeId');
                     if (oldNodeId != null) { response += '\r\nOldNodeID: ' + oldNodeId + '.'; }
                     if (process.platform == 'linux' || process.platform == 'freebsd') { response += '\r\nX11 support: ' + require('monitor-info').kvm_x11_support + '.'; }

@@ -41,6 +41,7 @@
         "agentPortTls": { "type": "boolean", "default": true, "description": "Indicates if the agent-only port must perform TLS, this should be set to false if TLS is performed in front of this server." },
         "agentCoreDump": { "type": "boolean", "default": false, "description": "Automatically activates and transfers any agent crash dump files to the server in meshcentral-data/coredumps." },
         "agentCoreDumpUsers": { "type": "array", "description": "List of non-administrator users that have access to mesh agent crash dumps." },
+        "ignoreAgentHashCheck": { "type": "boolean", "default": false, "description": "When true, the agent no longer checked the TLS certificate of the server. This should be used for debugging only." },
         "exactPorts": { "type": "boolean", "default": false },
         "allowLoginToken": { "type": "boolean", "default": false },
         "allowFraming": { "type": "boolean", "default": false, "description": "When enabled, the MeshCentral web site can be embedded within another website's iframe." },
@@ -248,6 +249,17 @@
               "Desktop": { "type": "string" },
               "Terminal": { "type": "string" },
               "Files": { "type": "string" }
+            }
+          },
+          "agentCustomization": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Use this section to customize the agent branding.",
+            "properties": {
+              "displayName": { "type": "string", "default": "MeshCentral Agent", "description": "The name of the agent as displayed to the user." },
+              "description": { "type": "string", "default": "Mesh Agent background service", "description": "The description of the agent as displayed to the user." },
+              "companyName": { "type": "string", "default": "Mesh Agent", "description": "This will be used as the path to install the agent, by default this is 'Mesh Agent' in Windows and 'meshagent' in other OS's." },
+              "serviceName": { "type": "string", "default": "Mesh Agent", "description": "The name of the background service, by default this is 'Mesh Agent' in Windows and 'meshagent' in other OS's but should be set to an all lower case, no space string." }
             }
           },
           "userAllowedIP": { "type": "string" },

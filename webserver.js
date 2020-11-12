@@ -2718,6 +2718,20 @@ module.exports.CreateWebServer = function (parent, db, args, certificates) {
         obj.meshDeviceFileHandler.CreateMeshDeviceFile(obj, null, res, req, domain, user, meshid, nodeid);
     }
 
+    // Handle download of a server file by an agent
+    function handleAgentDownloadFile(req, res) {
+        const domain = checkUserIpAddress(req, res);
+        if (domain == null) { return; }
+        if (req.query.c == null) { res.sendStatus(404); return; }
+
+        // Check the inbound desktop sharing cookie
+        var c = obj.parent.decodeCookie(req.query.c, obj.parent.loginCookieEncryptionKey, 5); // 5 minute timeout
+        if ((c == null) || (c.a != 'tmpdl') || (c.d != domain.id) || (c.nid == null) || (c.f == null) || (obj.common.IsFilenameValid(c.f) == false)) { res.sendStatus(404); return; }
+
+        // Send the file back
+        try { res.sendFile(obj.path.join(obj.filespath, 'tmp', c.f)); return; } catch (ex) { res.sendStatus(404); }
+    }
+
     // Handle logo request
     function handleLogoRequest(req, res) {
         const domain = checkUserIpAddress(req, res);
@@ -3150,6 +3164,88 @@ module.exports.CreateWebServer = function (parent, db, args, certificates) {
                 // Send a notification
                 obj.parent.DispatchEvent([user._id], obj, { action: 'notify', value: "Disk quota exceed", nolog: 1, id: Math.random() });
             }
+            res.send('');
+        });
+    }
+
+    // Upload a file to the server and then batch upload to many agents
+    function handleUploadFileBatch(req, res) {
+        const domain = checkUserIpAddress(req, res);
+        if (domain == null) { return; }
+        if (domain.userQuota == -1) { res.sendStatus(401); return; }
+        var authUserid = null;
+        if ((req.session != null) && (typeof req.session.userid == 'string')) { authUserid = req.session.userid; }
+        const multiparty = require('multiparty');
+        const form = new multiparty.Form();
+        form.parse(req, function (err, fields, files) {
+            // If an authentication cookie is embedded in the form, use that.
+            if ((fields != null) && (fields.auth != null) && (fields.auth.length == 1) && (typeof fields.auth[0] == 'string')) {
+                var loginCookie = obj.parent.decodeCookie(fields.auth[0], obj.parent.loginCookieEncryptionKey, 60); // 60 minute timeout
+                if ((loginCookie != null) && (obj.args.cookieipcheck !== false) && (loginCookie.ip != null) && (loginCookie.ip != req.clientIp)) { loginCookie = null; } // Check cookie IP binding.
+                if ((loginCookie != null) && (domain.id == loginCookie.domainid)) { authUserid = loginCookie.userid; } // Use cookie authentication
+            }
+            if (authUserid == null) { res.sendStatus(401); return; }
+
+            // Get the user
+            const user = obj.users[authUserid];
+            if ((user == null) || (user.siteadmin & 8) == 0) { res.sendStatus(401); return; } // Check if we have file rights
+
+            // Get fields
+            if ((fields == null) || (fields.nodeIds == null) || (fields.nodeIds.length != 1)) { res.sendStatus(404); return; }
+            var cmd = { nodeids: fields.nodeIds[0].split(','), files: [], user: user, domain: domain };
+            if ((fields.winpath != null) && (fields.winpath.length == 1)) { cmd.windowsPath = fields.winpath[0]; }
+            if ((fields.linuxpath != null) && (fields.linuxpath.length == 1)) { cmd.linuxPath = fields.linuxpath[0]; }
+            if ((fields.overwriteFiles != null) && (fields.overwriteFiles.length == 1) && (fields.overwriteFiles[0] == 'on')) { cmd.overwrite = true; }
+            if ((fields.createFolder != null) && (fields.createFolder.length == 1) && (fields.createFolder[0] == 'on')) { cmd.createFolder = true; }
+
+            // Get server temporary path
+            var serverpath = obj.path.join(obj.filespath, 'tmp')
+            try { obj.fs.mkdirSync(obj.parent.filespath); } catch (ex) { }
+            try { obj.fs.mkdirSync(serverpath); } catch (ex) { }
+
+            // More typical upload method, the file data is in a multipart mime post.
+            for (var i in files.files) {
+                var file = files.files[i], ftarget = getRandomPassword() + '-' + file.originalFilename, fpath = obj.path.join(serverpath, ftarget);
+                cmd.files.push({ name: file.originalFilename, target: ftarget });
+                // Rename the file
+                obj.fs.rename(file.path, fpath, function (err) {
+                    if (err && (err.code === 'EXDEV')) {
+                        // On some Linux, the rename will fail with a "EXDEV" error, do a copy+unlink instead.
+                        obj.common.copyFile(file.path, fpath, function (err) { obj.fs.unlink(file.path, function (err) { }); });
+                    }
+                });
+            }
+
+            // Instruct one of more agents to download a URL to a given local drive location.
+            var tlsCertHash = null;
+            // TODO: Once new mesh agents seem to work, re-enable this.
+            /*
+            if (parent.args.ignoreagenthashcheck !== true) {
+                tlsCertHash = obj.webCertificateFullHashs[cmd.domain.id];
+                if (tlsCertHash != null) { tlsCertHash = Buffer.from(tlsCertHash, 'binary').toString('hex'); }
+            }
+            */
+            for (var i in cmd.nodeids) {
+                obj.GetNodeWithRights(cmd.domain, cmd.user, cmd.nodeids[i], function (node, rights, visible) {
+                    if ((node == null) || ((rights & 8) == 0) || (visible == false)) return; // We don't have remote control rights to this device
+                    var agentPath = ((node.agent.id > 0) && (node.agent.id < 5)) ? cmd.windowsPath : cmd.linuxPath;
+
+                    // Event that this operation is being performed.
+                    var targets = obj.CreateNodeDispatchTargets(node.meshid, node._id, ['server-users', cmd.user._id]);
+                    var msgid = 103; // "Batch upload of {0} file(s) to folder {1}"
+                    var event = { etype: 'node', userid: cmd.user._id, username: cmd.user.name, nodeid: node._id, action: 'batchupload', msg: 'Performing batch upload of ' + cmd.files.length + ' file(s) to ' + agentPath, msgid: msgid, msgArgs: [cmd.files.length, agentPath], domain: cmd.domain.id };
+                    parent.DispatchEvent(targets, obj, event);
+
+                    // Send the agent commands to perform the batch upload operation
+                    for (var f in cmd.files) {
+                        const acmd = { action: 'wget', overwrite: cmd.overwrite, createFolder: cmd.createFolder, urlpath: '/agentdownload.ashx?c=' + obj.parent.encodeCookie({ a: 'tmpdl', d: cmd.domain.id, nid: node._id, f: cmd.files[f].target }, obj.parent.loginCookieEncryptionKey), path: obj.path.join(agentPath, cmd.files[f].name), folder: agentPath, servertlshash: tlsCertHash };
+                        var agent = obj.wsagents[node._id];
+                        if (agent != null) { try { agent.send(JSON.stringify(acmd)); } catch (ex) { } }
+                        // TODO: Add support for peer servers.
+                    }
+                });
+            }
+
             res.send('');
         });
     }
@@ -4104,7 +4200,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates) {
                 // Build the agent connection URL. If we are using a sub-domain or one with a DNS, we need to craft the URL correctly.
                 var xdomain = (domain.dns == null) ? domain.id : '';
                 if (xdomain != '') xdomain += '/';
-                var meshsettings = 'MeshName=' + mesh.name + '\r\nMeshType=' + mesh.mtype + '\r\nMeshID=0x' + meshidhex + '\r\nServerID=' + serveridhex + '\r\n';
+                var meshsettings = '\r\nMeshName=' + mesh.name + '\r\nMeshType=' + mesh.mtype + '\r\nMeshID=0x' + meshidhex + '\r\nServerID=' + serveridhex + '\r\n';
                 if (obj.args.lanonly != true) { meshsettings += 'MeshServer=wss://' + serverName + ':' + httpsPort + '/' + xdomain + 'agent.ashx\r\n'; } else {
                     meshsettings += 'MeshServer=local\r\n';
                     if ((obj.args.localdiscovery != null) && (typeof obj.args.localdiscovery.key == 'string') && (obj.args.localdiscovery.key.length > 0)) { meshsettings += 'DiscoveryKey=' + obj.args.localdiscovery.key + '\r\n'; }
@@ -4114,7 +4210,12 @@ module.exports.CreateWebServer = function (parent, db, args, certificates) {
                 if ((domain.agentnoproxy === true) || (obj.args.lanonly == true)) { meshsettings += 'ignoreProxyFile=1\r\n'; }
                 if (obj.args.agentconfig) { for (var i in obj.args.agentconfig) { meshsettings += obj.args.agentconfig[i] + '\r\n'; } }
                 if (domain.agentconfig) { for (var i in domain.agentconfig) { meshsettings += domain.agentconfig[i] + '\r\n'; } }
-
+                if (domain.agentcustomization != null) { // Add agent customization
+                    if (domain.agentcustomization.displayname != null) { meshsettings += 'displayName=' + domain.agentcustomization.displayname + '\r\n'; }
+                    if (domain.agentcustomization.description != null) { meshsettings += 'description=' + domain.agentcustomization.description + '\r\n'; }
+                    if (domain.agentcustomization.companyname != null) { meshsettings += 'companyName=' + domain.agentcustomization.companyname + '\r\n'; }
+                    if (domain.agentcustomization.servicename != null) { meshsettings += 'meshServiceName=' + domain.agentcustomization.servicename + '\r\n'; }
+                }
                 setContentDispositionHeader(res, 'application/octet-stream', meshfilename, null, argentInfo.rname);
                 obj.parent.exeHandler.streamExeWithMeshPolicy({ platform: 'win32', sourceFileName: obj.parent.meshAgentBinaries[req.query.id].path, destinationStream: res, msh: meshsettings, peinfo: obj.parent.meshAgentBinaries[req.query.id].pe });
             }
@@ -4402,7 +4503,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates) {
         // Build the agent connection URL. If we are using a sub-domain or one with a DNS, we need to craft the URL correctly.
         var xdomain = (domain.dns == null) ? domain.id : '';
         if (xdomain != '') xdomain += '/';
-        var meshsettings = 'MeshName=' + mesh.name + '\r\nMeshType=' + mesh.mtype + '\r\nMeshID=0x' + meshidhex + '\r\nServerID=' + serveridhex + '\r\n';
+        var meshsettings = '\r\nMeshName=' + mesh.name + '\r\nMeshType=' + mesh.mtype + '\r\nMeshID=0x' + meshidhex + '\r\nServerID=' + serveridhex + '\r\n';
         var httpsPort = ((obj.args.aliasport == null) ? obj.args.port : obj.args.aliasport); // Use HTTPS alias port is specified
         if (obj.args.agentport != null) { httpsPort = obj.args.agentport; } // If an agent only port is enabled, use that.
         if (obj.args.agentaliasport != null) { httpsPort = obj.args.agentaliasport; } // If an agent alias port is specified, use that.
@@ -4415,6 +4516,12 @@ module.exports.CreateWebServer = function (parent, db, args, certificates) {
         if ((domain.agentnoproxy === true) || (obj.args.lanonly == true)) { meshsettings += 'ignoreProxyFile=1\r\n'; }
         if (obj.args.agentconfig) { for (var i in obj.args.agentconfig) { meshsettings += obj.args.agentconfig[i] + '\r\n'; } }
         if (domain.agentconfig) { for (var i in domain.agentconfig) { meshsettings += domain.agentconfig[i] + '\r\n'; } }
+        if (domain.agentcustomization != null) { // Add agent customization
+            if (domain.agentcustomization.displayname != null) { meshsettings += 'displayName=' + domain.agentcustomization.displayname + '\r\n'; }
+            if (domain.agentcustomization.description != null) { meshsettings += 'description=' + domain.agentcustomization.description + '\r\n'; }
+            if (domain.agentcustomization.companyname != null) { meshsettings += 'companyName=' + domain.agentcustomization.companyname + '\r\n'; }
+            if (domain.agentcustomization.servicename != null) { meshsettings += 'meshServiceName=' + domain.agentcustomization.servicename + '\r\n'; }
+        }
 
         // Setup the response output
         var archive = require('archiver')('zip', { level: 5 }); // Sets the compression method.
@@ -4494,7 +4601,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates) {
         // Build the agent connection URL. If we are using a sub-domain or one with a DNS, we need to craft the URL correctly.
         var xdomain = (domain.dns == null) ? domain.id : '';
         if (xdomain != '') xdomain += '/';
-        var meshsettings = 'MeshName=' + mesh.name + '\r\nMeshType=' + mesh.mtype + '\r\nMeshID=0x' + meshidhex + '\r\nServerID=' + serveridhex + '\r\n';
+        var meshsettings = '\r\nMeshName=' + mesh.name + '\r\nMeshType=' + mesh.mtype + '\r\nMeshID=0x' + meshidhex + '\r\nServerID=' + serveridhex + '\r\n';
         var httpsPort = ((obj.args.aliasport == null) ? obj.args.port : obj.args.aliasport); // Use HTTPS alias port is specified
         if (obj.args.agentport != null) { httpsPort = obj.args.agentport; } // If an agent only port is enabled, use that.
         if (obj.args.agentaliasport != null) { httpsPort = obj.args.agentaliasport; } // If an agent alias port is specified, use that.
@@ -4507,6 +4614,12 @@ module.exports.CreateWebServer = function (parent, db, args, certificates) {
         if ((domain.agentnoproxy === true) || (obj.args.lanonly == true)) { meshsettings += 'ignoreProxyFile=1\r\n'; }
         if (obj.args.agentconfig) { for (var i in obj.args.agentconfig) { meshsettings += obj.args.agentconfig[i] + '\r\n'; } }
         if (domain.agentconfig) { for (var i in domain.agentconfig) { meshsettings += domain.agentconfig[i] + '\r\n'; } }
+        if (domain.agentcustomization != null) { // Add agent customization
+            if (domain.agentcustomization.displayname != null) { meshsettings += 'displayName=' + domain.agentcustomization.displayname + '\r\n'; }
+            if (domain.agentcustomization.description != null) { meshsettings += 'description=' + domain.agentcustomization.description + '\r\n'; }
+            if (domain.agentcustomization.companyname != null) { meshsettings += 'companyName=' + domain.agentcustomization.companyname + '\r\n'; }
+            if (domain.agentcustomization.servicename != null) { meshsettings += 'meshServiceName=' + domain.agentcustomization.servicename + '\r\n'; }
+        }
         return meshsettings;
     }
 
@@ -4793,6 +4906,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates) {
             obj.app.get(url + 'devicepowerevents.ashx', obj.handleDevicePowerEvents);
             obj.app.get(url + 'downloadfile.ashx', handleDownloadFile);
             obj.app.post(url + 'uploadfile.ashx', handleUploadFile);
+            obj.app.post(url + 'uploadfilebatch.ashx', handleUploadFileBatch);
             obj.app.post(url + 'uploadmeshcorefile.ashx', handleUploadMeshCoreFile);
             obj.app.get(url + 'userfiles/*', handleDownloadUserFiles);
             obj.app.ws(url + 'echo.ashx', handleEchoWebSocket);
@@ -4808,6 +4922,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates) {
             });
             obj.app.ws(url + 'devicefile.ashx', function (ws, req) { obj.meshDeviceFileHandler.CreateMeshDeviceFile(obj, ws, null, req, domain); });
             obj.app.get(url + 'devicefile.ashx', handleDeviceFile);
+            obj.app.get(url + 'agentdownload.ashx', handleAgentDownloadFile);
             obj.app.get(url + 'logo.png', handleLogoRequest);
             obj.app.get(url + 'loginlogo.png', handleLoginLogoRequest);
             obj.app.post(url + 'translations', handleTranslationsRequest);
